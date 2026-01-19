@@ -5,7 +5,7 @@ import os
 import sys
 import warnings
 from datetime import datetime
-
+import time
 warnings.filterwarnings('ignore')
 
 import random
@@ -294,6 +294,36 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+    parser.add_argument(
+    "--quantize",
+    action="store_true",
+    default=False,
+    help="Whether to quantize the model with fp8.",
+)
+    parser.add_argument(
+        "--fp8_recipe",
+        type=str,
+        default="Float8CurrentScaling",
+        choices=["Float8CurrentScaling", "Float8BlockScaling", "DelayedScaling"],
+        help="The fp8 recipe to use. Float8CurrentScaling is the default recipe.",
+    )
+    parser.add_argument(
+        "--compile",
+        type=bool,
+        default=False,
+        help="Whether to compile the ffn")
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="max-autotune-no-cudagraphs",
+        choices=["max-autotune-no-cudagraphs", "max-autotune", "reduced-overhead","default"],
+        help="The mode of the compile")
+    parser.add_argument(
+        "--tf32",
+        type=bool,
+        default=False,
+        help="If you want to enable cuda_tf32"
+    )
     args = parser.parse_args()
     _validate_args(args)
 
@@ -399,7 +429,10 @@ def generate(args):
             dist.broadcast_object_list(input_prompt, src=0)
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
-
+    if args.tf32:
+        logging.info("Enabling TF32")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     if "t2v" in args.task:
         logging.info("Creating WanT2V pipeline.")
         wan_t2v = wan.WanT2V(
@@ -412,8 +445,24 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            args=args,
         )
-
+        if args.compile:
+            wan_t2v.high_noise_model = torch.compile(wan_t2v.high_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+            wan_t2v.low_noise_model = torch.compile(wan_t2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+        if args.compile:
+            logging.info("warming up")
+            _ = wan_t2v.generate(
+                args.prompt,
+                size=SIZE_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        start_time = time.time()
         logging.info(f"Generating video ...")
         video = wan_t2v.generate(
             args.prompt,
@@ -437,9 +486,27 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            args=args,
         )
-
+        if args.compile:
+            wan_ti2v.high_noise_model = torch.compile(wan_ti2v.high_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+            wan_ti2v.low_noise_model = torch.compile(wan_ti2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+        if args.compile:
+            logging.info("warming up")
+            _ = wan_ti2v.generate(
+                args.prompt,
+                img=img,
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
         logging.info(f"Generating video ...")
+        start_time = time.time()
         video = wan_ti2v.generate(
             args.prompt,
             img=img,
@@ -464,9 +531,33 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
-            use_relighting_lora=args.use_relighting_lora
+            use_relighting_lora=args.use_relighting_lora,
+            args=args,
         )
+        if args.compile:
 
+            wan_animate.high_noise_model = torch.compile(wan_animate.high_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+            wan_animate.low_noise_model = torch.compile(wan_animate.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+
+            # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
+            torch.cuda.tunable.enable(val=True)
+
+            torch._dynamo.config.automatic_dynamic_shapes = False
+            torch._dynamo.config.cache_size_limit = 256
+        if args.compile:
+            logging.info("warming up")
+            _ = wan_animate.generate(
+                src_root_path=args.src_root_path,
+                replace_flag=args.replace_flag,
+                refert_num = args.refert_num,
+                clip_len=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        start_time = time.time()
         logging.info(f"Generating video ...")
         video = wan_animate.generate(
             src_root_path=args.src_root_path,
@@ -491,7 +582,41 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            args=args,
         )
+        if args.compile:
+
+            wan_s2v.high_noise_model = torch.compile(wan_s2v.high_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+            wan_s2v.low_noise_model = torch.compile(wan_s2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+
+            # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
+            torch.cuda.tunable.enable(val=True)
+
+            torch._dynamo.config.automatic_dynamic_shapes = False
+            torch._dynamo.config.cache_size_limit = 256
+        if args.compile:
+            logging.info("warming up")
+            _ = wan_s2v.generate(
+                        input_prompt=args.prompt,
+                        ref_image_path=args.image,
+                        audio_path=args.audio,
+                        enable_tts=args.enable_tts,
+                        tts_prompt_audio=args.tts_prompt_audio,
+                        tts_prompt_text=args.tts_prompt_text,
+                        tts_text=args.tts_text,
+                        num_repeat=args.num_clip,
+                        pose_video=args.pose_video,
+                        max_area=MAX_AREA_CONFIGS[args.size],
+                        infer_frames=args.infer_frames,
+                        shift=args.sample_shift,
+                        sample_solver=args.sample_solver,
+                        sampling_steps=args.sample_steps,
+                        guide_scale=args.sample_guide_scale,
+                        seed=args.base_seed,
+                        offload_model=args.offload_model,
+                        init_first_frame=args.start_from_ref,
+                    )
+        start_time = time.time()
         logging.info(f"Generating video ...")
         video = wan_s2v.generate(
             input_prompt=args.prompt,
@@ -513,6 +638,8 @@ def generate(args):
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
         )
+        end_time = time.time()
+        logging.info(f"Time taken to generate video: {end_time - start_time} seconds")
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -525,8 +652,33 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            args=args,
         )
         logging.info("Generating video ...")
+        if args.compile:
+
+            wan_i2v.high_noise_model = torch.compile(wan_i2v.high_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+            wan_i2v.low_noise_model = torch.compile(wan_i2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
+
+            # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
+            torch.cuda.tunable.enable(val=True)
+
+            torch._dynamo.config.automatic_dynamic_shapes = False
+            torch._dynamo.config.cache_size_limit = 256
+        if args.compile:
+            logging.info("warming up")
+            _ = wan_i2v.generate(
+                args.prompt,
+                img,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        start_time = time.time()
         video = wan_i2v.generate(
             args.prompt,
             img,
@@ -538,7 +690,8 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-
+    end_time = time.time()
+    logging.info(f"Time taken to generate video: {end_time - start_time} seconds")
     if rank == 0:
         if args.save_file is None:
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")

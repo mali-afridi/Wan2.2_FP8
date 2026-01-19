@@ -9,8 +9,9 @@ from functools import partial
 from einops import rearrange
 import numpy as np
 import torch
-
+import transformer_engine.pytorch as te
 import torch.distributed as dist
+import time
 from peft import set_peft_model_state_dict
 from decord import VideoReader
 from tqdm import tqdm
@@ -30,6 +31,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .quantization.utils import replace_with_te_layers,FP8_RECIPE_REGISTRY
 
 
 
@@ -47,7 +49,8 @@ class WanAnimate:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
-        use_relighting_lora=False
+        use_relighting_lora=False,
+        args=None
     ):
         r"""
         Initializes the generation model components.
@@ -119,7 +122,19 @@ class WanAnimate:
                 device_map=self.device)
         else:
             self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
+                checkpoint_dir, torch_dtype=torch.bfloat16 if args.quantize else self.param_dtype, device_map=self.device)
+        self.quantize=False
+        if args.quantize:
+            self.quantize=True
+            # torch.distributed.breakpoint()
+            start_replace_time = time.time()
+            counts=replace_with_te_layers(self.noise_model)
+            logging.info(
+                f"Replaced {counts['linear']} Linear layers "
+                f"and {counts['layernorm']} LayerNorm layers"
+            )
+            logging.info(f"Time taken to replace noise model with TE layers: {time.time() - start_replace_time:.2f}s")
+        shard_start = time.time()
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
@@ -131,6 +146,7 @@ class WanAnimate:
             checkpoint_dir=checkpoint_dir,
             config=config
             )
+        logging.info(f"Time taken to shard noise model: {time.time() - shard_start:.2f}s")
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -139,6 +155,7 @@ class WanAnimate:
 
         self.sample_neg_prompt = config.sample_neg_prompt
         self.sample_prompt = config.prompt
+        self.fp8_recipe = FP8_RECIPE_REGISTRY[getattr(args, "fp8_recipe", "Float8CurrentScaling")]()
 
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
@@ -348,6 +365,9 @@ class WanAnimate:
                 - H: Frame height 
                 - W: Frame width 
         """
+        if self.quantize:
+            logging.info(f"Using fp8 recipe: {type(self.fp8_recipe).__name__}")
+
         assert refert_num == 1 or refert_num == 5, "refert_num should be 1 or 5."
 
         seed_g = torch.Generator(device=self.device)
@@ -468,7 +488,7 @@ class WanAnimate:
                     target_shape[0],
                     target_shape[1],
                     target_shape[2],
-                    dtype=torch.float32,
+                    dtype=torch.float32 if not self.quantize else torch.bfloat16,
                     device=self.device,
                     generator=seed_g,
                 )
@@ -479,7 +499,7 @@ class WanAnimate:
                 raise ValueError(f"max_seq_len {max_seq_len} is not divisible by sp_size {self.sp_size}")
 
             with (
-                torch.autocast(device_type=str(self.device), dtype=torch.bfloat16, enabled=True),
+                torch.amp.autocast("cuda", dtype=self.param_dtype) if not self.quantize else te.autocast(enabled=True, recipe=self.fp8_recipe),
                 torch.no_grad()
             ):
                 if sample_solver == 'unipc':
@@ -605,7 +625,6 @@ class WanAnimate:
                     timestep = [t]
 
                     timestep = torch.stack(timestep)
-
                     noise_pred_cond = TensorList(
                          self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)
                     )

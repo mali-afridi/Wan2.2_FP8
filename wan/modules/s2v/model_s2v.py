@@ -2,7 +2,7 @@
 import math
 import types
 from copy import deepcopy
-
+import logging
 import numpy as np
 import torch
 import torch.cuda.amp as amp
@@ -10,7 +10,8 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
-
+import transformer_engine.pytorch as te
+import torch.nn.functional as F
 from ...distributed.sequence_parallel import (
     distributed_attention,
     gather_forward,
@@ -113,8 +114,68 @@ def sp_attn_forward_s2v(self,
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
         return q, k, v
+    def qkv_fn_sliced(x):
+        q = self.norm_q(self.q(x))[:, :s, :].view(b, s, n, d)
+        k = self.norm_k(self.k(x))[:, :s, :].view(b, s, n, d)
+        v = self.v(x)[:, :s, :].view(b, s, n, d)
+        return q, k, v
 
-    q, k, v = qkv_fn(x)
+
+    pad_divisor = 8
+    seq_len = x.shape[1]
+
+    # 2. Check if we are using TE and if padding is actually required
+
+    if hasattr(self.q, 'base_layer') and isinstance(self.q.base_layer, te.Linear) and (seq_len % pad_divisor != 0):
+
+        # Calculate amount to pad
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+
+        # Create zeros: [Batch, Pad_Amt, Hidden]
+        # We grab dim 0 (Batch) and dim 2 (Hidden) dynamically from x
+        padding = torch.zeros(
+            x.shape[0], pad_amt, x.shape[2], 
+            device=x.device, dtype=x.dtype
+        )
+
+        # Concatenate along DIM 1 (Sequence Length)
+        padded_input = torch.cat([x, padding], dim=1)
+
+        # Run the function with padded input
+        q, k, v = qkv_fn_sliced(padded_input)
+
+        # IMPORTANT: Slice the padding off the results immediately
+        # otherwise attention masks/RoPE will mismatch shapes later.
+        # q = q[:, :seq_len, :]
+        # k = k[:, :seq_len, :]
+        # v = v[:, :seq_len, :]
+    elif type(self.q).__name__ == "CachedTELinear":
+
+        # Calculate amount to pad
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+
+        # Create zeros: [Batch, Pad_Amt, Hidden]
+        # We grab dim 0 (Batch) and dim 2 (Hidden) dynamically from x
+        padding = torch.zeros(
+            x.shape[0], pad_amt, x.shape[2], 
+            device=x.device, dtype=x.dtype
+        )
+
+        # Concatenate along DIM 1 (Sequence Length)
+        padded_input = torch.cat([x, padding], dim=1)
+
+        # Run the function with padded input
+        q, k, v = qkv_fn_sliced(padded_input)
+
+        # IMPORTANT: Slice the padding off the results immediately
+        # otherwise attention masks/RoPE will mismatch shapes later.
+        # q = q[:, :seq_len, :]
+        # k = k[:, :seq_len, :]
+        # v = v[:, :seq_len, :]
+    else:
+        # Standard path (no padding needed or not using TE)
+        q, k, v = qkv_fn(x)
+
     q = rope_apply_usp(q, grid_sizes, freqs)
     k = rope_apply_usp(k, grid_sizes, freqs)
 
@@ -128,20 +189,36 @@ def sp_attn_forward_s2v(self,
 
     # output
     x = x.flatten(2)
-    x = self.o(x)
+
+    if hasattr(self.q, 'base_layer') and isinstance(self.q.base_layer, te.Linear) and (seq_len % 8 != 0):
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+        padding = torch.zeros(x.shape[0], pad_amt, x.shape[2], device=x.device, dtype=x.dtype)
+        x = torch.cat([x, padding], dim=1)
+        x = self.o(x)[:, :seq_len, :]
+    elif type(self.o).__name__ == "CachedTELinear":
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+        padding = torch.zeros(x.shape[0], pad_amt, x.shape[2], device=x.device, dtype=x.dtype)
+        x = torch.cat([x, padding], dim=1)
+        x = self.o(x)[:, :seq_len, :]
+    else:
+        x = self.o(x)
     return x
 
 
 class Head_S2V(Head):
 
-    def forward(self, x, e):
+    def forward(self, x, e,fp8_enabled=False):
         """
         Args:
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        assert e.dtype == torch.float32 if not fp8_enabled else e.dtype == torch.bfloat16
+        if not fp8_enabled:
+            with amp.autocast(dtype=torch.float32):
+                e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+                x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        else:
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -196,19 +273,30 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         self.self_attn = WanS2VSelfAttention(dim, num_heads, window_size,
                                              qk_norm, eps)
 
-    def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-        assert e[0].dtype == torch.float32
+    def forward(self,
+     x,
+     e,
+     seq_lens, grid_sizes, freqs, context, context_lens,fp8_enabled=False):
+        # Check if FP8 is enabled - if so, skip nested autocast to preserve FP8 context
+
+        fp8_enabled = (hasattr(self.cross_attn.q, 'base_layer') and isinstance(self.cross_attn.q.base_layer, te.Linear)) or \
+                      (type(self.cross_attn.q).__name__ == "CachedTELinear") or fp8_enabled
+        assert e[0].dtype == torch.float32 if not fp8_enabled else e[0].dtype == torch.bfloat16
+        
         seg_idx = e[1].item()
         seg_idx = min(max(0, seg_idx), x.size(1))
         seg_idx = [0, seg_idx, x.size(1)]
         e = e[0]
         modulation = self.modulation.unsqueeze(2)
-        with amp.autocast(dtype=torch.float32):
+        if not fp8_enabled:
+            with amp.autocast(dtype=torch.float32):
+                e = (modulation + e).chunk(6, dim=1)
+        else:
             e = (modulation + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        assert e[0].dtype == torch.float32 if not fp8_enabled else e[0].dtype == torch.bfloat16
 
         e = [element.squeeze(1) for element in e]
-        norm_x = self.norm1(x).float()
+        norm_x = self.norm1(x).float() if not fp8_enabled else self.norm1(x)
         parts = []
         for i in range(2):
             parts.append(norm_x[:, seg_idx[i]:seg_idx[i + 1]] *
@@ -216,23 +304,50 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         norm_x = torch.cat(parts, dim=1)
         # self-attention
         y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
-        with amp.autocast(dtype=torch.float32):
+
+        if not fp8_enabled:
+            with amp.autocast(dtype=torch.float32):
+                z = []
+                for i in range(2):
+                    z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[2][:, i:i + 1])
+                y = torch.cat(z, dim=1)
+                x = x + y
+        else:
             z = []
             for i in range(2):
                 z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[2][:, i:i + 1])
             y = torch.cat(z, dim=1)
             x = x + y
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
+        def cross_attn_ffn(x, context, context_lens, e,fp8_enabled):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            norm2_x = self.norm2(x).float()
+            norm2_x = self.norm2(x).float() if not fp8_enabled else self.norm2(x)
             parts = []
             for i in range(2):
                 parts.append(norm2_x[:, seg_idx[i]:seg_idx[i + 1]] *
                              (1 + e[4][:, i:i + 1]) + e[3][:, i:i + 1])
             norm2_x = torch.cat(parts, dim=1)
-            y = self.ffn(norm2_x)
-            with amp.autocast(dtype=torch.float32):
+            if fp8_enabled:
+                padding_divisor = 8
+                seq_len = norm2_x.shape[1]
+                padding_amt = (padding_divisor - (seq_len % padding_divisor)) % padding_divisor
+                if padding_amt > 0:
+                    norm2_x = F.pad(norm2_x, (0, 0, 0, padding_amt))
+                    y = self.ffn(norm2_x)[:, :seq_len, :]
+                else:
+                    y = self.ffn(norm2_x)
+            else:
+                norm2_x = norm2_x
+                y = self.ffn(norm2_x)
+            
+            if not fp8_enabled:
+                with amp.autocast(dtype=torch.float32):
+                    z = []
+                    for i in range(2):
+                        z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[5][:, i:i + 1])
+                    y = torch.cat(z, dim=1)
+                    x = x + y
+            else:
                 z = []
                 for i in range(2):
                     z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[5][:, i:i + 1])
@@ -240,7 +355,7 @@ class WanS2VAttentionBlock(WanAttentionBlock):
                 x = x + y
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e,fp8_enabled)
         return x
 
 
@@ -353,7 +468,8 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             dim=audio_dim,
             out_dim=self.dim,
             num_token=num_audio_token,
-            need_global=enable_adain)
+            need_global=enable_adain,
+            )
         all_modules, all_modules_names = torch_dfs(
             self.blocks, parent_name="root.transformer_blocks")
         self.audio_injector = AudioInjector_WAN(
@@ -598,7 +714,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             ]
         return x, seq_lens, rope_embs, mask_input
 
-    def after_transformer_block(self, block_idx, hidden_states):
+    def after_transformer_block(self, block_idx, hidden_states,fp8_enabled=False):
         if block_idx in self.audio_injector.injected_block_id.keys():
             audio_attn_id = self.audio_injector.injected_block_id[block_idx]
             audio_emb = self.merged_audio_emb  # b f n c
@@ -612,15 +728,22 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                                                 )  # b (f h w) c
             input_hidden_states = rearrange(
                 input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
-
             if self.enbale_adain and self.adain_mode == "attn_norm":
                 audio_emb_global = self.audio_emb_global
                 audio_emb_global = rearrange(audio_emb_global,
                                              "b t n c -> (b t) n c")
-                adain_hidden_states = self.audio_injector.injector_adain_layers[
-                    audio_attn_id](
-                        input_hidden_states, temb=audio_emb_global[:, 0])
-                attn_hidden_states = adain_hidden_states
+                if fp8_enabled:
+                    padding_divisor = 8
+                    dim_0 = audio_emb_global[:, 0].shape[0]
+                    padding_amt = (padding_divisor - (dim_0 % padding_divisor)) % padding_divisor
+                    if padding_amt > 0:
+                        audio_emb_global = F.pad(audio_emb_global[:, 0], (0, 0, 0, padding_amt)).unsqueeze(1)
+                        input_hidden_states = F.pad(input_hidden_states, (0,0,0, 0, 0, padding_amt))
+                    else:
+                        audio_emb_global = audio_emb_global
+                        input_hidden_states = input_hidden_states
+                adain_hidden_states = self.audio_injector.injector_adain_layers[audio_attn_id](input_hidden_states,temb=audio_emb_global[:, 0])
+                attn_hidden_states = adain_hidden_states if not fp8_enabled else adain_hidden_states[:dim_0, :, :]
             else:
                 attn_hidden_states = self.audio_injector.injector_pre_norm_feat[
                     audio_attn_id](
@@ -679,12 +802,14 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                             add_last_motion = 2: All motion-related latents are used.
         drop_motion_frames  Bool, whether drop the motion frames info
         """
+        fp8_enabled = (hasattr(self.blocks[0].cross_attn.q, 'base_layer') and isinstance(self.blocks[0].cross_attn.q.base_layer, te.Linear)) or \
+                      (type(self.blocks[0].cross_attn.q).__name__ == "CachedTELinear")
         add_last_motion = self.add_last_motion * add_last_motion
         audio_input = torch.cat([
             audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input
         ],
                                 dim=-1)
-        audio_emb_res = self.casual_audio_encoder(audio_input)
+        audio_emb_res = self.casual_audio_encoder(audio_input,fp8_enabled)
         if self.enbale_adain:
             audio_emb_global, audio_emb = audio_emb_res
             self.audio_emb_global = audio_emb_global[:,
@@ -775,12 +900,28 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        if not fp8_enabled:
+            with amp.autocast(dtype=torch.float32):
+            
 
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t,fp8=fp8_enabled).float())
+                e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+                assert e.dtype == torch.float32 and e0.dtype == torch.float32 if not fp8_enabled else e.dtype == torch.bfloat16 and e0.dtype == torch.bfloat16
+        else:
+            input = sinusoidal_embedding_1d(self.freq_dim, t,fp8=fp8_enabled)
+            padding_divisor = 8
+            dim_0 = input.shape[0]
+            padding_amt = (padding_divisor - (dim_0 % padding_divisor)) % padding_divisor
+            if padding_amt > 0:
+                input = F.pad(input, (0, 0, 0, padding_amt))
+            else:
+                input = input
+            e = self.time_embedding(input)
+
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim))[:dim_0, :]
+            e=e[:dim_0, :]
+            assert e.dtype == torch.bfloat16 and e0.dtype == torch.bfloat16
         if self.zero_timestep:
             e = e[:-1]
             zero_e0 = e0[-1:]
@@ -835,6 +976,8 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             self.pre_compute_freqs = self.pre_compute_freqs[sp_rank]
 
         # arguments
+        fp8_enabled = (hasattr(self.blocks[0].cross_attn.q, 'base_layer') and isinstance(self.blocks[0].cross_attn.q.base_layer, te.Linear)) or \
+                      (type(self.blocks[0].cross_attn.q).__name__ == "CachedTELinear")
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -844,7 +987,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             context_lens=context_lens)
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+            x = self.after_transformer_block(idx, x,fp8_enabled)
 
         # Context Parallel
         if self.use_context_parallel:
@@ -852,7 +995,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         # unpatchify
         x = x[:, :self.original_seq_len]
         # head
-        x = self.head(x, e)
+        x = self.head(x, e,fp8_enabled)
         x = self.unpatchify(x, original_grid_sizes)
         return [u.float() for u in x]
 

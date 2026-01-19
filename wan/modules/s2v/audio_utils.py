@@ -19,7 +19,8 @@ class CausalAudioEncoder(nn.Module):
                  out_dim=2048,
                  video_rate=8,
                  num_token=4,
-                 need_global=False):
+                 need_global=False,
+                 fp8_enabled=False):
         super().__init__()
         self.encoder = MotionEncoder_tc(
             in_dim=dim,
@@ -30,17 +31,23 @@ class CausalAudioEncoder(nn.Module):
 
         self.weights = torch.nn.Parameter(weight)
         self.act = torch.nn.SiLU()
-
-    def forward(self, features):
-        with amp.autocast(dtype=torch.float32):
-            # features B * num_layers * dim * video_length
+    def forward(self, features,fp8_enabled):
+        if not fp8_enabled:
+            with amp.autocast(dtype=torch.float32):
+                # features B * num_layers * dim * video_length
+                weights = self.act(self.weights)
+                weights_sum = weights.sum(dim=1, keepdims=True)
+                weighted_feat = ((features * weights) / weights_sum).sum(
+                    dim=1)  # b dim f
+                weighted_feat = weighted_feat.permute(0, 2, 1)  # b f dim
+                res = self.encoder(weighted_feat)  # b f n dim
+        else:
             weights = self.act(self.weights)
             weights_sum = weights.sum(dim=1, keepdims=True)
             weighted_feat = ((features * weights) / weights_sum).sum(
                 dim=1)  # b dim f
             weighted_feat = weighted_feat.permute(0, 2, 1)  # b f dim
             res = self.encoder(weighted_feat)  # b f n dim
-
         return res  # b f n dim
 
 

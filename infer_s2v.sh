@@ -1,0 +1,12 @@
+torchrun --nproc_per_node=8 generate.py \
+ --task s2v-14B \
+ --size 1024*704 \
+ --ckpt_dir /data/Ali/Wan2.2-S2V-14B/ \
+ --dit_fsdp \
+ --t5_fsdp \
+ --ulysses_size 8 \
+ --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard." \
+ --image "examples/i2v_input.JPG" \
+ --audio "examples/talk.wav" \
+ --quantize \
+ --fp8_recipe DelayedScaling 

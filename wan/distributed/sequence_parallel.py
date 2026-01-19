@@ -1,27 +1,23 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
-import torch.cuda.amp as amp
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
 
-
+import transformer_engine.pytorch as te
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
     pad_size = target_len - seq_len
     padding_tensor = torch.ones(
-        pad_size,
-        s1,
-        s2,
-        dtype=original_tensor.dtype,
-        device=original_tensor.device)
+        pad_size, s1, s2, dtype=original_tensor.dtype, device=original_tensor.device
+    )
     padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+@torch.amp.autocast("cuda", enabled=False)
+def rope_apply(x, grid_sizes, freqs, offset=0):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
@@ -37,22 +33,24 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-            s, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
+        freqs_i = torch.cat(
+            [
+                freqs[0][offset : f + offset].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(seq_len, 1, -1)
 
         # apply rotary embedding
         sp_size = get_world_size()
         sp_rank = get_rank()
         freqs_i = pad_freqs(freqs_i, s * sp_size)
         s_per_rank = s
-        freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *
-                                                       s_per_rank), :, :]
+        freqs_i_rank = freqs_i[
+            (sp_rank * s_per_rank) : ((sp_rank + 1) * s_per_rank), :, :
+        ]
         x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
         x_i = torch.cat([x_i, x[i, s:]])
 
@@ -67,46 +65,98 @@ def sp_dit_forward(
     t,
     context,
     seq_len,
+    train_mode=False,
     y=None,
+    reference_latent=None,
+    fp8_enabled=False, # skip last block quantization
 ):
     """
     x:              A list of videos each with shape [C, T, H, W].
     t:              [B].
     context:        A list of text embeddings each with shape [L, C].
     """
-    if self.model_type == 'i2v':
+    if self.model_type == "i2v":
         assert y is not None
     # params
     device = self.patch_embedding.weight.device
     if self.freqs.device != device:
         self.freqs = self.freqs.to(device)
 
-    if y is not None:
+    DOES_PATCH_EMBEDDING_ANCHOR_EXIST = False
+    if hasattr(self, "patch_embedding_anchor"):
+        DOES_PATCH_EMBEDDING_ANCHOR_EXIST = True
+
+    PATCH_EMBEDDING_REFERENCE_EXIST = False
+    if hasattr(self, "patch_embedding_reference"):
+        PATCH_EMBEDDING_REFERENCE_EXIST = True
+
+    if y is not None and not DOES_PATCH_EMBEDDING_ANCHOR_EXIST:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    # if y is not None:
+    #     x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
     # embeddings
     x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-    grid_sizes = torch.stack(
-        [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+    if DOES_PATCH_EMBEDDING_ANCHOR_EXIST:
+        y_anchor = [self.patch_embedding_anchor(u.unsqueeze(0)) for u in y]
+        x = [u + v for u, v in zip(x, y_anchor)]
+    grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
     x = [u.flatten(2).transpose(1, 2) for u in x]
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
     assert seq_lens.max() <= seq_len
     x = torch.cat([
-        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
-        for u in x
+        torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x
     ])
 
     # time embeddings
     if t.dim() == 1:
-        t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+        if reference_latent is None:
+            t = t.expand(t.size(0), seq_len)
+        else:
+            t = t.expand(t.size(0), seq_len * 2)
+    elif t.dim() == 2 and reference_latent is not None:
+        t = torch.cat([t, t], dim=1)
+    else:
+        raise ValueError(f"t.dim() is {t.dim()}")
+
+    # Check if FP8 is enabled - if so, skip nested autocast to preserve FP8 context
+    fp8_enabled = (hasattr(self.blocks[0].cross_attn.q, 'base_layer') and isinstance(self.blocks[0].cross_attn.q.base_layer, te.Linear)) or \
+                  (type(self.blocks[0].cross_attn.q).__name__ == "CachedTELinear") or fp8_enabled
+    
+    if not fp8_enabled:
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            bt = t.size(0)
+            t = t.flatten()
+            if reference_latent is None:
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t)
+                    .unflatten(0, (bt, seq_len))
+                    .float()
+                )
+            else:
+                e = self.time_embedding(
+                    sinusoidal_embedding_1d(self.freq_dim, t)
+                    .unflatten(0, (bt, seq_len * 2))
+                    .float()
+                )
+            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    else:
         bt = t.size(0)
         t = t.flatten()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim,
-                                    t).unflatten(0, (bt, seq_len)).float())
+        if reference_latent is None:
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t,fp8=fp8_enabled)
+                .unflatten(0, (bt, seq_len))
+            )
+        else:
+            e = self.time_embedding(
+                sinusoidal_embedding_1d(self.freq_dim, t,fp8=fp8_enabled)
+                .unflatten(0, (bt, seq_len * 2))
+            )
         e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        assert e.dtype == torch.bfloat16 and e0.dtype == torch.bfloat16
 
     # context
     context_lens = None
@@ -114,10 +164,35 @@ def sp_dit_forward(
         torch.stack([
             torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
             for u in context
-        ]))
+        ])
+    )
+
+    # reference latent processing
+    vref = None
+    if reference_latent is not None:
+        if PATCH_EMBEDDING_REFERENCE_EXIST:
+            vref = [torch.cat([v[4:]], dim=0) for v in reference_latent]
+            vref = [self.patch_embedding_reference(u.unsqueeze(0)) for u in vref]
+        else:
+            vref = [torch.cat([v[4:], v], dim=0) for v in reference_latent]
+            vref = [self.patch_embedding(u.unsqueeze(0)) for u in vref]
+
+        vref = [u.flatten(2).transpose(1, 2) for u in vref]
+        seq_lens = torch.tensor([u.size(1) for u in vref], dtype=torch.long)
+        assert seq_lens.max() <= seq_len
+        vref = torch.cat([
+            torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
+            for u in vref
+        ])
+        # 2x the seq_len to account for the temporal dimension
+        seq_lens = seq_lens * 2
+        grid_sizes[:, 0] = grid_sizes[:, 0] * 2
 
     # Context Parallel
     x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+    if reference_latent is not None:
+        vref = torch.chunk(vref, get_world_size(), dim=1)[get_rank()]
+        x = torch.cat([x, vref], dim=1)
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
@@ -128,8 +203,10 @@ def sp_dit_forward(
         grid_sizes=grid_sizes,
         freqs=self.freqs,
         context=context,
-        context_lens=context_lens)
-
+        context_lens=context_lens,
+        add_ref_video=True if reference_latent is not None else False,
+        fp8_enabled=fp8_enabled,
+    )
     for block in self.blocks:
         x = block(x, **kwargs)
 
@@ -137,14 +214,33 @@ def sp_dit_forward(
     x = self.head(x, e)
 
     # Context Parallel
-    x = gather_forward(x, dim=1)
+    if not train_mode:
+        if reference_latent is not None:
+            x = x.chunk(2, dim=1)[0]
+            x = gather_forward(x, dim=1).contiguous()
+            tmp_grid_sizes = grid_sizes.clone()
+            tmp_grid_sizes[:, 0] = tmp_grid_sizes[:, 0] // 2
+            x = self.unpatchify(x, tmp_grid_sizes)
+        else:
+            x = gather_forward(x, dim=1).contiguous()
+            x = self.unpatchify(x, grid_sizes)
+    else:
+        sharded_grid_sizes = grid_sizes.clone()
+        sharded_grid_sizes[:, 0] = sharded_grid_sizes[:, 0] // get_world_size()
+        x = self.unpatchify(x, sharded_grid_sizes)
+        # Convert list of tensors into batch dimension
+        x = torch.stack(x, dim=0)
+        if reference_latent is not None:
+            x = x.chunk(2, dim=2)
+            x = x[0]
+        return x
 
-    # unpatchify
-    x = self.unpatchify(x, grid_sizes)
     return [u.float() for u in x]
 
 
-def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
+def sp_attn_forward(
+    self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16, add_ref_video=False
+):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -158,9 +254,86 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         v = self.v(x).view(b, s, n, d)
         return q, k, v
 
-    q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
+    def qkv_fn_sliced(x):
+        # Slice x or the output to length 's' (5566) to remove 2       padding tokens
+        # It is usually cleaner to slice x once at the start:
+
+        q = self.norm_q(self.q(x))[:, :s, :].view(b, s, n, d)
+        k = self.norm_k(self.k(x))[:, :s, :].view(b, s, n, d)
+        v = self.v(x)[:, :s, :].view(b, s, n, d)
+
+        return q, k, v
+    pad_divisor = 8
+    seq_len = x.shape[1]
+
+    # 2. Check if we are using TE and if padding is actually required
+
+    if hasattr(self.q, 'base_layer') and isinstance(self.q.base_layer, te.Linear) and (seq_len % pad_divisor != 0):
+
+        # Calculate amount to pad
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+
+        # Create zeros: [Batch, Pad_Amt, Hidden]
+        # We grab dim 0 (Batch) and dim 2 (Hidden) dynamically from x
+        padding = torch.zeros(
+            x.shape[0], pad_amt, x.shape[2], 
+            device=x.device, dtype=x.dtype
+        )
+
+        # Concatenate along DIM 1 (Sequence Length)
+        padded_input = torch.cat([x, padding], dim=1)
+
+        # Run the function with padded input
+        q, k, v = qkv_fn_sliced(padded_input)
+
+        # IMPORTANT: Slice the padding off the results immediately
+        # otherwise attention masks/RoPE will mismatch shapes later.
+        # q = q[:, :seq_len, :]
+        # k = k[:, :seq_len, :]
+        # v = v[:, :seq_len, :]
+    elif type(self.q).__name__ == "CachedTELinear":
+
+        # Calculate amount to pad
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+
+        # Create zeros: [Batch, Pad_Amt, Hidden]
+        # We grab dim 0 (Batch) and dim 2 (Hidden) dynamically from x
+        padding = torch.zeros(
+            x.shape[0], pad_amt, x.shape[2], 
+            device=x.device, dtype=x.dtype
+        )
+
+        # Concatenate along DIM 1 (Sequence Length)
+        padded_input = torch.cat([x, padding], dim=1)
+
+        # Run the function with padded input
+        q, k, v = qkv_fn_sliced(padded_input)
+
+        # IMPORTANT: Slice the padding off the results immediately
+        # otherwise attention masks/RoPE will mismatch shapes later.
+        # q = q[:, :seq_len, :]
+        # k = k[:, :seq_len, :]
+        # v = v[:, :seq_len, :]
+    else:
+        # Standard path (no padding needed or not using TE)
+        q, k, v = qkv_fn(x)
+
+    if add_ref_video:
+        grid_sizes = grid_sizes.clone()
+        grid_sizes[:, 0] = grid_sizes[:, 0] // 2
+        q_in, q_ref = q.chunk(2, dim=1)
+        k_in, k_ref = k.chunk(2, dim=1)
+
+        q_in = rope_apply(q_in, grid_sizes, freqs, offset=0)
+        k_in = rope_apply(k_in, grid_sizes, freqs, offset=0)
+        q_ref = rope_apply(q_ref, grid_sizes, freqs, offset=50)
+        k_ref = rope_apply(k_ref, grid_sizes, freqs, offset=50)
+
+        q = torch.cat([q_in, q_ref], dim=1)
+        k = torch.cat([k_in, k_ref], dim=1)
+    else:
+        q = rope_apply(q, grid_sizes, freqs)
+        k = rope_apply(k, grid_sizes, freqs)
 
     x = distributed_attention(
         half(q),
@@ -172,5 +345,16 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
 
     # output
     x = x.flatten(2)
-    x = self.o(x)
+    if hasattr(self.q, 'base_layer') and isinstance(self.q.base_layer, te.Linear) and (seq_len % 8 != 0):
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+        padding = torch.zeros(x.shape[0], pad_amt, x.shape[2], device=x.device, dtype=x.dtype)
+        x = torch.cat([x, padding], dim=1)
+        x = self.o(x)[:, :seq_len, :]
+    elif type(self.o).__name__ == "CachedTELinear":
+        pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+        padding = torch.zeros(x.shape[0], pad_amt, x.shape[2], device=x.device, dtype=x.dtype)
+        x = torch.cat([x, padding], dim=1)
+        x = self.o(x)[:, :seq_len, :]
+    else:
+        x = self.o(x)
     return x

@@ -8,7 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
-
+import time
 import numpy as np
 import torch
 import torch.cuda.amp as amp
@@ -28,7 +28,8 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
+import transformer_engine.pytorch as te
+from .quantization.utils import replace_with_te_layers,FP8_RECIPE_REGISTRY
 
 class WanI2V:
 
@@ -44,6 +45,7 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        args=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -100,30 +102,49 @@ class WanI2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
-
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+        LOW_NOISE_SUBFOLDER = "low_noise_model"
+        
+        # Load low noise model from provided path
+        self.low_noise_model = self.prepare_models(checkpoint_dir=checkpoint_dir,DIT_SUBFOLDER=LOW_NOISE_SUBFOLDER,quantize=args.quantize,use_sp=use_sp,dit_fsdp=dit_fsdp,shard_fn=shard_fn,convert_model_dtype=convert_model_dtype)
+        HIGH_NOISE_SUBFOLDER = "high_noise_model"
+        
+        self.high_noise_model = self.prepare_models(checkpoint_dir=checkpoint_dir,DIT_SUBFOLDER=HIGH_NOISE_SUBFOLDER,quantize=args.quantize,use_sp=use_sp,dit_fsdp=dit_fsdp,shard_fn=shard_fn,convert_model_dtype=convert_model_dtype)
         if use_sp:
             self.sp_size = get_world_size()
         else:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+        self.fp8_recipe = FP8_RECIPE_REGISTRY[getattr(args, "fp8_recipe", "Float8CurrentScaling")]()
+    def prepare_models(self,checkpoint_dir,DIT_SUBFOLDER,quantize=False,use_sp=False,dit_fsdp=False,shard_fn=None,convert_model_dtype=False):
+        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        dit_model = WanModel.from_pretrained(
+                checkpoint_dir,
+                subfolder=DIT_SUBFOLDER,
+                torch_dtype=torch.bfloat16 if quantize else torch.float32,
+                device_map = self.device
+            )
+        self.quantize=False
+        if quantize:
+            self.quantize=True
+            start_replace_time = time.time()
+            counts=replace_with_te_layers(dit_model)
+            logging.info(
+                f"Replaced {counts['linear']} Linear layers "
+                f"and {counts['layernorm']} LayerNorm layers"
+            )
+            logging.info(f"Time taken to replace DiT model {DIT_SUBFOLDER} with TE layers: {time.time() - start_replace_time:.2f}s")
+        shard_start = time.time()
+        dit_model = self._configure_model(
+            model=dit_model,
+            use_sp=use_sp,
+            dit_fsdp=dit_fsdp,
+            shard_fn=shard_fn,
+            convert_model_dtype=convert_model_dtype,
+        )
+        logging.info(f"Time taken to shard DiT model: {time.time() - shard_start:.2f}s")
+        return dit_model
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -253,6 +274,9 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        if self.quantize:
+            logging.info(f"Using fp8 recipe: {type(self.fp8_recipe).__name__}")
+
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
@@ -333,7 +357,7 @@ class WanI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast("cuda", dtype=self.param_dtype) if not self.quantize else te.autocast(enabled=True, recipe=self.fp8_recipe),
                 torch.no_grad(),
                 no_sync_low_noise(),
                 no_sync_high_noise(),

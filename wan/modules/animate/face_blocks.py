@@ -6,10 +6,11 @@ from einops import rearrange
 import torch.nn.functional as F
 import math
 from ...distributed.util import gather_forward, get_rank, get_world_size
-
+import torch.utils.checkpoint as te
 
 try:
-    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+    # from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+    from flash_attn_interface import flash_attn_func #fix
 except ImportError:
     flash_attn_func = None
 
@@ -342,12 +343,41 @@ class FaceBlock(nn.Module):
         B, T, N, C = motion_vec.shape
         T_comp = T
 
+
         x_motion = self.pre_norm_motion(motion_vec)
         x_feat = self.pre_norm_feat(x)
+        def fp8_pad_for_dim(x, dim, divisor=8):
+            shape = x.shape
+            prod_other = 1
+            for i in range(len(shape) - 1):
+                if i != dim:
+                    prod_other *= shape[i]
 
-        kv = self.linear1_kv(x_motion)
-        q = self.linear1_q(x_feat)
-
+            p = 0
+            while (prod_other * (shape[dim] + p)) % divisor != 0:
+                p += 1
+            return p
+        use_fp8 = False
+        if (hasattr(self.linear1_kv, 'base_layer') and isinstance(self.linear1_kv.base_layer, te.Linear)) or (type(self.linear1_kv).__name__ == "CachedTELinear"):
+            use_fp8 = True
+            pad_t = fp8_pad_for_dim(x_motion, dim=1)
+            pad_xfeat = fp8_pad_for_dim(x_feat, dim=1)
+            x_motion = F.pad(x_motion, (0, 0,   # D
+                            0, 0,   # S
+                            0, pad_t,  # T  ← HERE
+                            0, 0))  # B
+            x_feat = F.pad(
+            x_feat,
+            (0, 0,      # D
+            0, pad_xfeat, # T  ← HERE
+            0, 0)     # B
+        )
+            kv = self.linear1_kv(x_motion)[:,:x_motion.shape[1]-pad_t,:]
+            q = self.linear1_q(x_feat)[:,:x_feat.shape[1]-pad_xfeat,:]
+        else:
+            kv = self.linear1_kv(x_motion)
+            q = self.linear1_q(x_feat)
+        
         k, v = rearrange(kv, "B L N (K H D) -> K B L N H D", K=2, H=self.heads_num)
         q = rearrange(q, "B S (H D) -> B S H D", H=self.heads_num)
 
@@ -360,7 +390,6 @@ class FaceBlock(nn.Module):
 
         if use_context_parallel:
             q = gather_forward(q, dim=1)
-
         q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T_comp)  
         # Compute attention.
         attn = attention(
@@ -374,8 +403,14 @@ class FaceBlock(nn.Module):
         attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T_comp)
         if use_context_parallel:
             attn = torch.chunk(attn, get_world_size(), dim=1)[get_rank()]
-
-        output = self.linear2(attn)
+        
+        
+        if use_fp8:
+            pad_attn = fp8_pad_for_dim(attn, dim=1)
+            attn = F.pad(attn, (0, 0, 0, pad_attn))
+            output = self.linear2(attn)[:,:attn.shape[1]-pad_attn,:]
+        else:
+            output = self.linear2(attn)
 
         if motion_mask is not None:
             output = output * rearrange(motion_mask, "B T H W -> B (T H W)").unsqueeze(-1)

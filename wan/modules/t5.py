@@ -496,7 +496,7 @@ class T5EncoderModel:
         model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
         self.model = model
         if shard_fn is not None:
-            self.model = shard_fn(self.model, sync_module_states=False)
+            self.model = shard_fn(self.model)
         else:
             self.model.to(self.device)
         # init tokenizer

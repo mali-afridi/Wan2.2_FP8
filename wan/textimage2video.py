@@ -8,7 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
-
+import time
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
@@ -29,6 +29,8 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import best_output_size, masks_like
+from .quantization.utils import replace_with_te_layers,FP8_RECIPE_REGISTRY
+import transformer_engine.pytorch as te
 
 
 class WanTI2V:
@@ -45,6 +47,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        args=None,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -100,13 +103,27 @@ class WanTI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = WanModel.from_pretrained(checkpoint_dir,device_map=self.device)
+        self.quantize=False
+        if args.quantize:
+            self.quantize=True
+            # torch.distributed.breakpoint()
+            start_replace_time = time.time()
+            counts=replace_with_te_layers(self.model)
+            logging.info(
+                f"Replaced {counts['linear']} Linear layers "
+                f"and {counts['layernorm']} LayerNorm layers"
+            )
+            logging.info(f"Time taken to replace noise model with TE layers: {time.time() - start_replace_time:.2f}s")
+        shard_start = time.time()
+
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+        logging.info(f"Time taken to shard model: {time.time() - shard_start:.2f}s")
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -114,6 +131,7 @@ class WanTI2V:
             self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        self.fp8_recipe = FP8_RECIPE_REGISTRY[getattr(args, "fp8_recipe", "Float8CurrentScaling")]()
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -209,6 +227,9 @@ class WanTI2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        if self.quantize:
+            logging.info(f"Using fp8 recipe: {type(self.fp8_recipe).__name__}")
+
         # i2v
         if img is not None:
             return self.i2v(
@@ -327,7 +348,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast("cuda", dtype=self.param_dtype) if not self.quantize else te.autocast(enabled=True, recipe=self.fp8_recipe),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -519,7 +540,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast("cuda", dtype=self.param_dtype) if not self.quantize else te.autocast(enabled=True, recipe=self.fp8_recipe),
                 torch.no_grad(),
                 no_sync(),
         ):

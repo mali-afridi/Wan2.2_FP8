@@ -1,0 +1,11 @@
+python -m torch.distributed.run --nnodes 1 --nproc_per_node 8 generate.py \
+    --task animate-14B \
+    --ckpt_dir /data/Ali/Wan2.2-Animate-14B/ \
+    --src_root_path ./examples/wan_animate/animate/process_results/ \
+    --refert_num 1 \
+    --dit_fsdp \
+    --t5_fsdp \
+    --ulysses_size 8 \
+    --tf32 True \
+    --quantize \
+    --fp8_recipe DelayedScaling 

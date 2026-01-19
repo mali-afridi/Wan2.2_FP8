@@ -299,9 +299,12 @@ class Generator(nn.Module):
         self.enc = Encoder(size, style_dim, motion_dim)
         self.dec = Synthesis(motion_dim)
 
-    def get_motion(self, img):
+    def get_motion(self, img,fp8_enabled=False):
         #motion_feat = self.enc.enc_motion(img)
         motion_feat = torch.utils.checkpoint.checkpoint((self.enc.enc_motion), img, use_reentrant=True)
-        with torch.cuda.amp.autocast(dtype=torch.float32):
+        if not fp8_enabled:
+            with torch.cuda.amp.autocast(dtype=torch.float32):
+                motion = self.dec.direction(motion_feat)
+        else:
             motion = self.dec.direction(motion_feat)
         return motion

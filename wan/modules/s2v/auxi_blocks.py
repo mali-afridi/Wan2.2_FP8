@@ -236,7 +236,19 @@ class MotionEncoder_tc(nn.Module):
         x = rearrange(x, 'b c t -> b t c')
         x = self.norm3(x)
         x = self.act(x)
-        x = self.final_linear(x)
+        if type(self.final_linear).__name__ == "CachedTELinear": #fp8 division by 8
+            pad_divisor = 8 
+            seq_len = x.shape[1]
+            pad_amt = (pad_divisor - (seq_len % pad_divisor)) % pad_divisor
+
+            if pad_amt > 0:
+                x = F.pad(x, (0, 0, 0, pad_amt))
+            
+                x = self.final_linear(x)[:, :seq_len, :]
+            else:
+                x = self.final_linear(x)
+        else:
+            x = self.final_linear(x)
         x = rearrange(x, '(b n) t c -> b t n c', b=b)
 
         return x, x_local

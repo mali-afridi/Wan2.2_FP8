@@ -12,6 +12,7 @@ from functools import partial
 
 import numpy as np
 import torch
+import transformer_engine.pytorch as te
 import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
@@ -34,6 +35,9 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .quantization.utils import replace_with_te_layers,FP8_RECIPE_REGISTRY
+
+import time
 
 
 def load_safetensors(path):
@@ -58,6 +62,7 @@ class WanS2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        args=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -115,11 +120,26 @@ class WanS2V:
         if not dit_fsdp:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir,
-                torch_dtype=self.param_dtype,
+                torch_dtype=torch.bfloat16 if args.quantize else torch.float32,
                 device_map=self.device)
         else:
             self.noise_model = WanModel_S2V.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
+                checkpoint_dir,
+                torch_dtype=torch.bfloat16 if args.quantize else torch.float32,
+                device_map=self.device
+                )
+        self.quantize=False
+        if args.quantize:
+            self.quantize=True
+            # torch.distributed.breakpoint()
+            start_replace_time = time.time()
+            counts=replace_with_te_layers(self.noise_model)
+            logging.info(
+                f"Replaced {counts['linear']} Linear layers "
+                f"and {counts['layernorm']} LayerNorm layers"
+            )
+            logging.info(f"Time taken to replace noise model with TE layers: {time.time() - start_replace_time:.2f}s")
+        shard_start = time.time()
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
@@ -127,6 +147,7 @@ class WanS2V:
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype)
+        logging.info(f"Time taken to shard noise model: {time.time() - shard_start:.2f}s")
 
         self.audio_encoder = AudioEncoder(
             model_id=os.path.join(checkpoint_dir,
@@ -142,6 +163,7 @@ class WanS2V:
         self.drop_first_motion = config.drop_first_motion
         self.fps = config.sample_fps
         self.audio_sample_m = 0
+        self.fp8_recipe = FP8_RECIPE_REGISTRY[getattr(args, "fp8_recipe", "Float8CurrentScaling")]()
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype):
@@ -457,6 +479,9 @@ class WanS2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        if self.quantize:
+            logging.info(f"Using fp8 recipe: {type(self.fp8_recipe).__name__}")
+
         # preprocess
         size = self.get_gen_size(
             size=None,
@@ -534,7 +559,7 @@ class WanS2V:
         out = []
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast("cuda", dtype=self.param_dtype) if not self.quantize else te.autocast(enabled=True, recipe=self.fp8_recipe),
                 torch.no_grad(),
         ):
             for r in range(num_repeat):

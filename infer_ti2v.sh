@@ -1,0 +1,1 @@
+python generate.py --task ti2v-5B --size 1280*704 --ckpt_dir /data/Ali/Wan2.2-TI2V-5B --offload_model True --convert_model_dtype --t5_cpu --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage"
