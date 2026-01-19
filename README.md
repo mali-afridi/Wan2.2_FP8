@@ -106,32 +106,26 @@ bash infer_t2v.sh
 bash infer_animate.sh
 bash infer_s2v.sh
 ```
-## Quality Comparison
 
+## 🎥 Quality Comparison (I2V)
 
-## Quality Comparison
-
-<table>
+<table align="center">
   <tr>
-    <th align="center">Baseline</th>
-    <th align="center">FP8</th>
+    <th align="center" width="50%">Baseline (FA2)</th>
+    <th align="center" width="50%">FP8 Quantized</th>
   </tr>
   <tr>
     <td align="center">
-      <video width="360" controls loop muted playsinline>
-        <source src="assets/base.mp4" type="video/mp4">
-      </video>
+      <video src="https://github.com/user-attachments/assets/165a4b4d-d684-4614-bdf6-f314f2339d3d" width="100%" controls autoplay loop muted></video>
     </td>
     <td align="center">
-      <video width="360" controls loop muted playsinline>
-        <source src="assets/quant.mp4" type="video/mp4">
-      </video>
+      <video src="https://github.com/user-attachments/assets/981bd07f-c8e3-4539-9625-01a0f02e5fc4" width="100%" controls autoplay loop muted></video>
     </td>
   </tr>
 </table>
 
+_Resolution: 1280*720, 40 steps & base_seed: 50. FP8 E4M3 DelayedScaling with amax_history_len=16 & amax_compute_algo="max"_
 
----
 
 ## 🧠 FP8 Quantization & Technical Implementation
 ### 🛠️ Solving the "Divisible by 8 and 16" Constraint
