@@ -1,38 +1,21 @@
 # Wan2.2 with FP8 Quantization (NVIDIA Transformer Engine)
 
-<p align="left">
-  <video width="400" height="480" controls autoplay loop muted>
-    <source src="https://github.com/user-attachments/assets/a9d7d260-6d15-4679-8f7c-be3d5168deba" type="video/mp4">
-  </video>
-</p>
 
 <p align="center">
-  <video width="400" height="480" controls autoplay loop muted>
-    <source src="https://github.com/user-attachments/assets/919697bd-f981-47d9-a764-0ca186ab5ecb" type="video/mp4">
-  </video>
-</p>
-
-<p align="right">
-<img width="400" height="480" alt="image" src="https://github.com/user-attachments/assets/c9e9327b-8c14-427f-9acd-1e0e084d424b" />
-</p>
-
-<p align="left">
-   <b>Baseline</b>
-</p>
-
-<p align="center">
-   <b>FP8</b>
+<img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/c9e9327b-8c14-427f-9acd-1e0e084d424b" />
 </p>
 
 ---
 
 ## ⚡ Introduction
 
-**Want a training-free inference boost using Floating Point 8 Quantization for Wan2.2 video generation without relying on `torch.compile` to work with `torchao`?** That's where NVIDIA's **[Transformer Engine](https://github.com/NVIDIA/TransformerEngine.git)** comes into play! 
+**Want a training-free inference boost** using Floating Point 8 Quantization for Wan2.2 video generation **without relying on `torch.compile` to work with `torchao`?** That's where NVIDIA's **[Transformer Engine](https://github.com/NVIDIA/TransformerEngine.git)** comes into play! 
 
-If you quantize during inference using torchao, you need to use `torch.compile` in order to achieve speedup from the quantization. While `torch.compile` offers great speedups, using a full-graph compilation can be challenging in production environments due to inherent code graph breaks and complexities with FSDP (Fully Sharded Data Parallel)—especially when LoRAs are involved. Furthermore, distilling models works well for base model inference but often loses context when fine-tuned downstream task LoRAs are merged on top of it.
+If you quantize during inference using `torchao`, you need to use `torch.compile` in order to achieve speedup from the quantization ([source](https://pytorch.org/blog/pytorch-native-architecture-optimization/)).<br>
+While `torch.compile` offers great speedups, using a full-graph compilation can be challenging in production environments due to inherent code graph breaks and complexities with FSDP (Fully Sharded Data Parallel)—especially when LoRAs are involved. <br>
+Furthermore, distilling models works well for base model inference but often loses context when fine-tuned downstream task LoRAs are merged on top of it.<br>
 
-**This repository implements FP8 quantization using NVIDIA's Transformer Engine to achieve significant speedups while maintaining quality without relying on torch.compile.**
+This repository **implements FP8 quantization** using **NVIDIA's Transformer Engine** to achieve significant **speedups** while **maintaining quality** without relying on torch.compile.
 I have also included the support of Magcache for I2V on 8xH100, which you can use with FA3 and FP8!
 
 ## Key Features:
@@ -123,13 +106,34 @@ bash infer_t2v.sh
 bash infer_animate.sh
 bash infer_s2v.sh
 ```
+## Quality Comparison
+
+
+## Quality Comparison
+
+<table>
+  <tr>
+    <th align="center">Baseline</th>
+    <th align="center">FP8</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <video width="360" controls loop muted playsinline>
+        <source src="assets/base.mp4" type="video/mp4">
+      </video>
+    </td>
+    <td align="center">
+      <video width="360" controls loop muted playsinline>
+        <source src="assets/quant.mp4" type="video/mp4">
+      </video>
+    </td>
+  </tr>
+</table>
+
 
 ---
 
 ## 🧠 FP8 Quantization & Technical Implementation
-
-
-
 ### 🛠️ Solving the "Divisible by 8 and 16" Constraint
 
 A major challenge when applying FP8 quantization to video generation models like Wan2.2 is the strict tensor dimension requirement of the Transformer Engine kernel:
