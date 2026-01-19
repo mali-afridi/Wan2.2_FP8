@@ -69,7 +69,7 @@ source fp8/bin/activate
 bash install_requirements.sh
 ```
 ## Usage Example
-Make sure you download the models [T2V](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers), [I2V](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers), [Animate](https://huggingface.co/Wan-AI/Wan2.2-Animate-14B) and [S2V](https://huggingface.co/Wan-AI/Wan2.2-S2V-14B).
+Make sure you have download the models [T2V](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers), [I2V](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers), [Animate](https://huggingface.co/Wan-AI/Wan2.2-Animate-14B) and [S2V](https://huggingface.co/Wan-AI/Wan2.2-S2V-14B).
 I have prepared the bash scripts for `I2V`, `T2V`, `Animate` & `S2V`. Magcache is supported for I2V only for now. I can easily extend it to others if required. 
 ##### To use FP8 E4M3 DelayedScaling:
 ```bash
