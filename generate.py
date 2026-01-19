@@ -429,6 +429,7 @@ def generate(args):
             dist.broadcast_object_list(input_prompt, src=0)
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
+    torch.cuda.tunable.enable(val=True)
     if args.tf32:
         logging.info("Enabling TF32")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -540,8 +541,6 @@ def generate(args):
             wan_animate.low_noise_model = torch.compile(wan_animate.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
 
             # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
-            torch.cuda.tunable.enable(val=True)
-
             torch._dynamo.config.automatic_dynamic_shapes = False
             torch._dynamo.config.cache_size_limit = 256
         if args.compile:
@@ -590,7 +589,6 @@ def generate(args):
             wan_s2v.low_noise_model = torch.compile(wan_s2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
 
             # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
-            torch.cuda.tunable.enable(val=True)
 
             torch._dynamo.config.automatic_dynamic_shapes = False
             torch._dynamo.config.cache_size_limit = 256
@@ -661,8 +659,6 @@ def generate(args):
             wan_i2v.low_noise_model = torch.compile(wan_i2v.low_noise_model,mode=args.compile_mode,dynamic=False,fullgraph=False)
 
             # wan_i2v.vae.model = torch.compile(wan_i2v.vae.model,mode="max-autotune",dynamic=False,fullgraph=False)
-            torch.cuda.tunable.enable(val=True)
-
             torch._dynamo.config.automatic_dynamic_shapes = False
             torch._dynamo.config.cache_size_limit = 256
         if args.compile:
