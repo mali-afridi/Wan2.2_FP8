@@ -30,7 +30,7 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 import transformer_engine.pytorch as te
 from .quantization.utils import replace_with_te_layers,FP8_RECIPE_REGISTRY
-
+from .magcache_fsdp_wrapper import MagCacheManager, get_timesteps,MAGCACHE_RATIOS
 class WanI2V:
 
     def __init__(
@@ -117,6 +117,73 @@ class WanI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
         self.fp8_recipe = FP8_RECIPE_REGISTRY[getattr(args, "fp8_recipe", "Float8CurrentScaling")]()
+        self.magcache_args = args
+        self.magcache_cfg = config
+        self.use_magcache = getattr(args, 'use_magcache', False)
+        self.magcache_manager = None
+        if self.use_magcache:
+            self._apply_magcache()
+    def _apply_magcache(self):
+        """Apply MagCache to both high and low noise models after FSDP configuration"""
+
+        if not self.use_magcache:
+            return
+        logging.info("Applying MagCache to both DiT models...")
+        magcache_start = time.perf_counter()
+
+        # Create a single MagCache manager that will be shared by both models
+        split_step = None
+        if (
+            self.magcache_cfg
+            and hasattr(self.magcache_cfg, "boundary")
+            and hasattr(self.magcache_args, "sample_shift")
+        ):
+            timesteps = get_timesteps(
+                shift=self.magcache_args.sample_shift,
+                num_inference_steps=self.magcache_args.sample_steps,
+            )
+            high_noise_steps = (
+                (
+                    timesteps
+                    >= (
+                        self.magcache_cfg.num_train_timesteps
+                        * self.magcache_cfg.boundary
+                    )
+                )
+                .sum()
+                .item()
+            )
+            split_step = high_noise_steps
+
+        
+        # Create and attach manager to both models
+        self.magcache_manager = MagCacheManager(
+            mag_ratios=MAGCACHE_RATIOS,
+            num_steps=self.magcache_args.sample_steps,
+            split_step=split_step,
+            mode="i2v",
+            magcache_thresh=getattr(self.magcache_args, "magcache_thresh", 0.15),
+            K=getattr(self.magcache_args, "magcache_K", 10),
+            retention_ratio=getattr(self.magcache_args, "retention_ratio", 0.5),
+        )
+
+        # Attach to both models - they will share the same manager and state
+        self.magcache_manager.attach(
+            self.high_noise_model, model_name="high_noise_model"
+        )
+        self.magcache_manager.attach(self.low_noise_model, model_name="low_noise_model")
+
+        logging.info(
+            f"MagCache applied to both models in {time.perf_counter() - magcache_start:.2f}s"
+        )
+
+    def cleanup_magcache(self):
+        """Clean up MagCache manager if active"""
+        if self.magcache_manager:
+            self.magcache_manager.detach()
+            self.magcache_manager = None
+
+
     def prepare_models(self,checkpoint_dir,DIT_SUBFOLDER,quantize=False,use_sp=False,dit_fsdp=False,shard_fn=None,convert_model_dtype=False):
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         dit_model = WanModel.from_pretrained(

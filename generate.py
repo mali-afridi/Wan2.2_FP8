@@ -324,6 +324,31 @@ def _parse_args():
         default=False,
         help="If you want to enable cuda_tf32"
     )
+    parser.add_argument(
+            "--magcache_thresh",
+            type=float,
+            default=0.04,
+            help="the upper bound of accumulated err")
+    parser.add_argument(
+        "--retention_ratio",
+        type=float,
+        default=0.2,
+        help="Retention ratio of unchanged steps")
+    parser.add_argument(
+        "--magcache_K",
+        type=int,
+        default=2,
+        help="max skip steps")
+    parser.add_argument(
+        "--use_magcache",
+        action="store_true",
+        default=False,
+        help="Use MagCache for inference after the magcache_calibration")
+    parser.add_argument(
+        "--magcache_calibration",
+        action="store_true",
+        default=False,
+        help="Calibrate the Average Magnitude Ratio for MagCache.")
     args = parser.parse_args()
     _validate_args(args)
 
