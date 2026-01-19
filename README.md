@@ -57,7 +57,7 @@ sudo apt-get -y install cudnn9-cuda-12
 
 ```bash
 # Clone the repository
-git clone [https://github.com/mali-afridi/Wan2.2_FP8.git](https://github.com/mali-afridi/Wan2.2_FP8.git)
+git clone https://github.com/mali-afridi/Wan2.2_FP8.git
 cd Wan2.2_FP8
 
 #Make virtual environment
